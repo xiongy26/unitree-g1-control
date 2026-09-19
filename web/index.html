@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Unitree G1 · ZMP-based Walking · MuJoCo WebAssembly</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin:0; height:100%; overflow:hidden; background:#0b1020;
+               font-family:"Segoe UI",Arial,"Microsoft YaHei",sans-serif; }
+  #app { position:fixed; inset:0; }
+  canvas { display:block; }
+  .panel { position:absolute; padding:10px 14px; border-radius:10px;
+           background:rgba(8,12,26,.72); backdrop-filter:blur(6px);
+           color:#e8eeff; font-size:13px; border:1px solid #26325a; }
+  #title { top:14px; left:16px; line-height:1.5; font-size:14px; }
+  #title .big { font-size:17px; font-weight:600; letter-spacing:.4px; }
+  #title .red { color:#ff5a5a; font-weight:600; }
+  #ctrl { top:14px; right:16px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+          max-width:420px; }
+  #ctrl label { color:#9fb0d8; font-size:12px; }
+  #ctrl input { width:64px; background:#141c33; color:#e8eeff;
+                border:1px solid #2a3a66; border-radius:6px; padding:3px 6px; }
+  #ctrl button { background:#274b8f; color:#fff; border:0; border-radius:6px;
+                 padding:5px 14px; cursor:pointer; }
+  #ctrl button:hover { background:#3563b8; }
+  #status { bottom:14px; left:16px; min-width:330px; color:#8fe08f; white-space:pre; }
+  #legend { bottom:14px; right:16px; color:#9fb0d8; line-height:1.6; }
+  .sw { display:inline-block; width:18px; height:3px; border-radius:2px; margin-right:6px;
+        vertical-align:middle; }
+  #minimap { position:absolute; right:16px; top:96px; background:rgba(8,12,26,.72);
+             border:1px solid #26325a; border-radius:10px; }
+  #banner { position:absolute; left:50%; top:38%; transform:translate(-50%,-50%);
+            font-size:26px; color:#ffd25a; text-shadow:0 2px 12px #000;
+            display:none; font-weight:700; }
+  a { color:#8fb0ff; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "./lib/three/three.module.js",
+    "three/addons/controls/OrbitControls.js": "./lib/three/addons/controls/OrbitControls.js",
+    "three/addons/loaders/STLLoader.js": "./lib/three/addons/loaders/STLLoader.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app"></div>
+
+<div id="title" class="panel">
+  <div class="big">ZMP-based Walking</div>
+  <div>+ Double Support Phase: <span id="t-ds">0.1</span> sec</div>
+  <div>+ Single Support Phase: <span id="t-ss">0.6</span> sec</div>
+  <div>+ Step Length: <span id="t-len" class="red">0.25 m</span></div>
+  <div>with Weighted Whole-Body Control</div>
+  <div style="color:#9fb0d8;margin-top:4px">MuJoCo WebAssembly · 单文件浏览器内仿真</div>
+</div>
+
+<div id="ctrl" class="panel">
+  <button id="btn-pause">⏸ 暂停</button>
+  <button id="btn-reset">⟳ 重置</button>
+  <button id="btn-cam">📷 相机跟随</button>
+  <label>步数 <input id="in-steps" value="8"></label>
+  <label>步长 <input id="in-len" value="0.12" step="0.05"></label>
+  <label>单支撑 <input id="in-ss" value="0.4" step="0.05"></label>
+  <label>双支撑 <input id="in-ds" value="0.10" step="0.02"></label>
+</div>
+
+<canvas id="minimap" width="260" height="200"></canvas>
+
+<div id="status" class="panel">loading…</div>
+<div id="legend" class="panel">
+  <div><span class="sw" style="background:#40ff50"></span>规划 ZMP 参考（支撑脚序列）</div>
+  <div><span class="sw" style="background:#ffffff"></span>实际 CoM 轨迹</div>
+  <div><span class="sw" style="background:#ffd24a"></span>落脚点</div>
+  <div>拖动旋转视角 · 滚轮缩放</div>
+</div>
+<div id="banner"></div>
+
+<script type="module" src="./js/main.js"></script>
+</body>
+</html>

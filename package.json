@@ -1,0 +1,6 @@
+{
+  "name": "g1-zmp-walking-web",
+  "private": true,
+  "type": "module",
+  "description": "Unitree G1 ZMP walking in the browser (MuJoCo WASM). The package.json exists so Node treats the ES modules under web/js as ESM when running the headless harness."
+}

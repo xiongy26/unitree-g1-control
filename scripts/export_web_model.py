@@ -3,7 +3,9 @@
 1. web/model/g1_wasm.xml  -- flattened, self-contained scene XML
 2. web/model/assets/*.STL -- mesh files for the virtual FS
 3. web/gains.json         -- ZMP preview-control gains (Kx, kr) computed with scipy
-4. web/model_desc.json    -- body/geom description for the three.js renderer
+
+The three.js renderer builds visuals directly from the COMPILED model's mesh
+buffers (web/js/viewer.js), so no separate render description is exported.
 """
 import json
 import re
@@ -128,86 +130,6 @@ def build_model_xml() -> None:
     print(f"g1_wasm.xml OK: nq={m.nq} nv={m.nv} nu={m.nu} nbody={m.nbody} ngeom={m.ngeom}")
 
 
-def export_model_desc() -> None:
-    """Body/geom description for the three.js side."""
-    model = mujoco.MjModel.from_xml_path(str(MODEL_DIR / "g1_wasm.xml"))
-
-    # mesh name -> asset filename (names may differ from files)
-    mesh_file = {}
-    asset_txt = sections_text(MODEL_DIR / "g1_wasm.xml", "asset")
-    for m in re.finditer(r'<mesh\b[^>]*/>', asset_txt):
-        tag = m.group(0)
-        name_m = re.search(r'name="([^"]+)"', tag)
-        file_m = re.search(r'file="([^"]+)"', tag)
-        if not file_m:
-            continue
-        fname = file_m.group(1)
-        mname = name_m.group(1) if name_m else fname.rsplit(".", 1)[0]
-        mesh_file[mname] = fname
-
-    meshes = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_MESH, i)
-              for i in range(model.nmesh)]
-
-    bodies = []
-    for b in range(1, model.nbody):          # skip world
-        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b)
-        geoms = []
-        for g in range(model.ngeom):
-            if model.geom_bodyid[g] != b:
-                continue
-            gtype = int(model.geom_type[g])
-            mat_id = model.geom_matid[g]
-            rgba = model.geom_rgba[g].tolist()
-            if mat_id >= 0:
-                rgba = model.mat_rgba[mat_id].tolist()
-            entry = dict(
-                id=g, type=gtype, pos=model.geom_pos[g].tolist(),
-                quat=model.geom_quat[g].tolist(), rgba=rgba,
-                group=int(model.geom_group[g]),
-                size=model.geom_size[g].tolist(),
-            )
-            if gtype == int(mujoco.mjtGeom.mjGEOM_MESH):
-                entry["mesh"] = mesh_file[meshes[model.geom_dataid[g]]]
-                # MuJoCo recenters mesh vertices at compile time: it folds the
-                # mesh asset transform (mesh_pos, mesh_quat) into geom_pos/
-                # geom_quat and stores *centered* vertices. three.js loads the
-                # RAW STL, so the child transform must undo the asset
-                # transform:  A = X_geom ∘ M⁻¹.
-                mid = model.geom_dataid[g]
-                mpos = model.mesh_pos[mid]
-                mq = model.mesh_quat[mid]          # wxyz
-                gq = model.geom_quat[g]            # wxyz
-                # mq inverse
-                mqi = [mq[0], -mq[1], -mq[2], -mq[3]]
-                # quat = geom_quat ⊗ mesh_quat⁻¹
-                w1, x1, y1, z1 = gq
-                w2, x2, y2, z2 = mqi
-                entry["quat"] = [
-                    w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-                    w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-                    w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-                    w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-                ]
-                # pos = geom_pos - R(geom_quat) @ mesh_pos
-                R = np.zeros(9)
-                mujoco.mju_quat2Mat(R, gq)
-                R = R.reshape(3, 3)
-                entry["pos"] = (model.geom_pos[g] - R @ mpos).tolist()
-            if int(model.geom_group[g]) in (0, 1) or gtype == int(mujoco.mjtGeom.mjGEOM_PLANE):
-                continue                      # skip non-visual helper geoms
-            geoms.append(entry)
-        bodies.append(dict(id=b, name=name, geoms=geoms))
-
-    desc = dict(
-        nq=int(model.nq), nv=int(model.nv), nu=int(model.nu),
-        key_stand_qpos=model.key_qpos[0].tolist(),
-        bodies=bodies,
-    )
-    (WEB / "model_desc.json").write_text(json.dumps(desc))
-    n_meshes = sum(1 for b in bodies for g in b["geoms"] if "mesh" in g)
-    print(f"model_desc.json: {len(bodies)} bodies, {n_meshes} visual mesh geoms")
-
-
 def sections_text(path, tag):
     """Return the inner text of a top-level XML section."""
     xml = Path(path).read_text(encoding="utf-8")
@@ -233,5 +155,4 @@ def export_gains() -> None:
 
 if __name__ == "__main__":
     build_model_xml()
-    export_model_desc()
     export_gains()

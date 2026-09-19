@@ -1,11 +1,19 @@
-// three.js rendering: robot from model_desc.json, checker floor, trails,
-// footfall markers and a top-view minimap.
+// three.js rendering: robot built DIRECTLY from the compiled MuJoCo model's
+// mesh buffers, checker floor, trails, footfall markers and a top-view
+// minimap.
+//
+// Why not load the STL files? MuJoCo recomputes mesh frames at compile time
+// (it recenters vertices and folds the mesh asset transform into
+// geom_pos/geom_quat). The vertices in `model.mesh_vert` are therefore
+// ALREADY in the frame that `geom_pos`/`geom_quat` expect, so applying those
+// transforms directly is self-consistent — no manual compensation that can
+// drift per-mesh (the "scattered arms" class of bugs). This mirrors the
+// approach of zalo/mujoco_wasm and g1-kitchen-web.
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 
 export class Viewer3D {
-  constructor(container, desc) {
+  constructor(container, mujoco, model) {
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     this.renderer.setSize(innerWidth, innerHeight);
@@ -34,7 +42,7 @@ export class Viewer3D {
     this.followCam = true;
 
     this._buildFloor();
-    this._buildRobot(desc);
+    this._buildRobot(mujoco, model);
 
     // trails
     this.comTrail = this._makeTrail(0xffffff, 4000, 0.011);
@@ -77,61 +85,81 @@ export class Viewer3D {
     this.zUpRoot.add(floor);
   }
 
-  _buildRobot(desc) {
+  _buildRobot(mujoco, model) {
     this.bodyGroups = new Map();
-    const loader = new STLLoader();
     const meshCache = new Map();
-    const getGeom = (name) => new Promise((resolve) => {
-      if (meshCache.has(name)) { meshCache.get(name).then(resolve); return; }
-      const p = loader.loadAsync(`./model/assets/${name}`).then((geo) => {
-        geo.computeVertexNormals();
-        meshCache.set(name, Promise.resolve(geo));
-        return geo;
-      });
-      meshCache.set(name, p);
-      p.then(resolve);
-    });
+    const MESH = mujoco.mjtGeom.mjGEOM_MESH.value;
+    const CYL = mujoco.mjtGeom.mjGEOM_CYLINDER.value;
+    const SPH = mujoco.mjtGeom.mjGEOM_SPHERE.value;
+    const BOX = mujoco.mjtGeom.mjGEOM_BOX.value;
+    const PLANE = mujoco.mjtGeom.mjGEOM_PLANE.value;
 
-    for (const body of desc.bodies) {
-      const grp = new THREE.Group();
-      for (const geo of body.geoms) {
-        let mesh = null;
-        const rgba = geo.rgba;
-        const color = new THREE.Color(rgba[0], rgba[1], rgba[2]);
-        const mat = new THREE.MeshStandardMaterial({
-          color, roughness: 0.45, metalness: 0.35,
-        });
-        if (geo.type === 7) { // mesh
-          getGeom(geo.mesh).then((geometry) => {
-            const m = new THREE.Mesh(geometry, mat);
-            this._applyLocal(m, geo);
-            m.castShadow = true; m.receiveShadow = true;
-            grp.add(m);
-          });
-          continue;
-        } else if (geo.type === 5) { // cylinder (size: radius, half-length)
-          mesh = new THREE.Mesh(
-            new THREE.CylinderGeometry(geo.size[0], geo.size[0], 2 * geo.size[1], 24), mat);
-        } else if (geo.type === 2) { // sphere
-          mesh = new THREE.Mesh(new THREE.SphereGeometry(geo.size[0], 20, 14), mat);
-        } else if (geo.type === 6) { // box
-          mesh = new THREE.Mesh(
-            new THREE.BoxGeometry(2 * geo.size[0], 2 * geo.size[1], 2 * geo.size[2]), mat);
+    for (let g = 0; g < model.ngeom; g++) {
+      if (model.geom_group[g] >= 3) continue;   // visual geoms only
+      const type = model.geom_type[g];
+      if (type === PLANE) continue;             // the floor is built below
+      const size = [model.geom_size[g * 3], model.geom_size[g * 3 + 1],
+                    model.geom_size[g * 3 + 2]];
+
+      let geometry = null;
+      if (type === MESH) {
+        const mid = model.geom_dataid[g];
+        if (!meshCache.has(mid)) {
+          geometry = new THREE.BufferGeometry();
+          const va = model.mesh_vertadr[mid], vn = model.mesh_vertnum[mid];
+          const fa = model.mesh_faceadr[mid], fn = model.mesh_facenum[mid];
+          // .slice() on the WASM heap views yields plain typed arrays (a
+          // copy), which three.js needs — passing heap views directly breaks
+          // its buffer bookkeeping (createBuffer expects .byteLength).
+          const verts = model.mesh_vert.slice(va * 3, (va + vn) * 3);
+          const faces = model.mesh_face.slice(fa * 3, (fa + fn) * 3);
+          geometry.setAttribute('position',
+            new THREE.BufferAttribute(new Float32Array(verts), 3));
+          geometry.setIndex(Array.from(faces));
+          geometry.computeVertexNormals();
+          meshCache.set(mid, geometry);
         } else {
-          continue;
+          geometry = meshCache.get(mid);
         }
-        this._applyLocal(mesh, geo);
-        mesh.castShadow = true; mesh.receiveShadow = true;
-        grp.add(mesh);
+      } else if (type === CYL) {
+        geometry = new THREE.CylinderGeometry(size[0], size[0], 2 * size[1], 24);
+      } else if (type === SPH) {
+        geometry = new THREE.SphereGeometry(size[0], 20, 14);
+      } else if (type === BOX) {
+        geometry = new THREE.BoxGeometry(2 * size[0], 2 * size[1], 2 * size[2]);
+      } else {
+        continue;
       }
-      this.bodyGroups.set(body.id, grp);
-      this.zUpRoot.add(grp);
-    }
-  }
 
-  _applyLocal(mesh, geo) {
-    mesh.position.set(geo.pos[0], geo.pos[1], geo.pos[2]);
-    mesh.quaternion.set(geo.quat[1], geo.quat[2], geo.quat[3], geo.quat[0]);
+      let rgba = [model.geom_rgba[g * 4], model.geom_rgba[g * 4 + 1],
+                  model.geom_rgba[g * 4 + 2], model.geom_rgba[g * 4 + 3]];
+      const matId = model.geom_matid[g];
+      if (matId !== -1) {
+        rgba = [model.mat_rgba[matId * 4], model.mat_rgba[matId * 4 + 1],
+                model.mat_rgba[matId * 4 + 2], model.mat_rgba[matId * 4 + 3]];
+      }
+      const mat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(rgba[0], rgba[1], rgba[2]),
+        transparent: rgba[3] < 1, opacity: rgba[3],
+        roughness: 0.45, metalness: 0.35,
+      });
+      const mesh = new THREE.Mesh(geometry, mat);
+      mesh.castShadow = mesh.receiveShadow = true;
+      // geom local pose — the compiled vertices/frame match these directly
+      mesh.position.set(model.geom_pos[g * 3], model.geom_pos[g * 3 + 1],
+                        model.geom_pos[g * 3 + 2]);
+      mesh.quaternion.set(model.geom_quat[g * 4 + 1], model.geom_quat[g * 4 + 2],
+                          model.geom_quat[g * 4 + 3], model.geom_quat[g * 4]);
+
+      const b = model.geom_bodyid[g];
+      let grp = this.bodyGroups.get(b);
+      if (!grp) {
+        grp = new THREE.Group();
+        this.bodyGroups.set(b, grp);
+        this.zUpRoot.add(grp);
+      }
+      grp.add(mesh);
+    }
   }
 
   _makeTrail(color, maxPts, width) {
@@ -171,11 +199,9 @@ export class Viewer3D {
       this.footfallGroup.add(s);
     }
   }
-  syncFromData(data, desc) {
-    for (const body of desc.bodies) {
-      const grp = this.bodyGroups.get(body.id);
-      if (!grp) continue;
-      const o3 = body.id * 3, o4 = body.id * 4;
+  syncFromData(data) {
+    for (const [b, grp] of this.bodyGroups) {
+      const o3 = b * 3, o4 = b * 4;
       grp.position.set(data.xpos[o3], data.xpos[o3 + 1], data.xpos[o3 + 2]);
       grp.quaternion.set(data.xquat[o4 + 1], data.xquat[o4 + 2], data.xquat[o4 + 3],
                          data.xquat[o4]);

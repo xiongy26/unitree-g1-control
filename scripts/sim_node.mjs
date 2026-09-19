@@ -27,7 +27,7 @@ const has = (name) => args.includes(name);
 // ------------------------------------------------------------------- params
 // mirror main.js defaults
 const params = {
-  nSteps: parseInt(argVal('--steps', 8)), stepLength: parseFloat(argVal('--len', 0.12)),
+  nSteps: parseInt(argVal('--steps', 16)), stepLength: parseFloat(argVal('--len', 0.12)),
   tInit: 1.0, tSS: parseFloat(argVal('--ss', 0.4)), tDS: parseFloat(argVal('--ds', 0.10)),
   tFinal: 1.0, extraHold: 0.5, swingHeight: parseFloat(argVal('--sh', 0.10)), footCenterDx: 0.035,
   stanceInset: 0.02, firstSwing: 'left',
@@ -44,7 +44,7 @@ const params = {
   copFeedbackLim: parseFloat(argVal('--coplim', 0.04)),
   swingEndFrac: parseFloat(argVal('--swingend', 0.85)),
   servoComp: parseFloat(argVal('--servocomp', 0.7)),
-  clockGain: parseFloat(argVal('--clockgain', 3)),
+  clockGain: parseFloat(argVal('--clockgain', 2)),
   clockVelGain: parseFloat(argVal('--clockvel', 0)),
   stanceInset: parseFloat(argVal('--inset', 0.02)),
   weights: {

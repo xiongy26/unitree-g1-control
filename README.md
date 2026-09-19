@@ -49,15 +49,15 @@ py scripts/serve_web.py 8765
 
 | 步数 | 步长 | 结果 |
 | --- | --- | --- |
-| 4 / 8 / 12 / 16 | 0.10 m | 全部走完，不跌倒 |
-| 4 / 8 / 12 | 0.12 m | 全部走完，不跌倒 |
-| 默认 | SS 0.4s / DS 0.10s | 横向 CoM 误差 < 13 cm，全程稳定 |
+| 4 / 8 / 12 / 16 / 20 | 0.10 m 或 0.12 m | 全部走完，不跌倒 |
+| 默认 16 步 × 0.12 m | ≈1.9 m / 14 s | 横向 CoM 误差 < 9 cm，全程稳定 |
+| 极限 | 24 步以上 | 收尾阶段累积失稳跌倒 |
 
 步态质量：摆动脚实际离地约 **5 cm**（目标 10 cm，IK 加权折衷 + 位置执行器
 滞后各吃掉一半；进一步提高摆动权重/增益会进入 IK-执行器闭环的不稳定区），
 矢状向 CoM 跟踪误差 < 12 cm，行进距离约为计划的 85-95%。
 
-- 已知局限：步长 ≥ 0.14 m、单支撑 ≥ 0.5 s、或 16 步 × 0.12 m 的极限组合会失稳。
+- 已知局限：步长 ≥ 0.14 m、单支撑 ≥ 0.5 s、或 24 步以上的超长行走会失稳。
 - `scripts/sim_node.mjs` 是无头回归 harness：`node scripts/sim_node.mjs
   [--steps N] [--len L] [--ss T] [--ds T]`，用与浏览器完全相同的
   controller.js + 模型做快速定量验证，输出 PASS/FAIL。
@@ -68,9 +68,14 @@ py scripts/serve_web.py 8765
    原代码写成 `s³(10−15s+6s)`，`minjerk(0.84)=1.45 > 1`——摆动脚轨迹中后段
    冲到落点前方 40%、z 冲到地面以下 3.4 cm，摆动脚中途砸地拖行 → CoP 离开
    支撑脚 → 重量转移失败 → 横向发散。这是"走 3~4 步跌倒"的直接根因。
-2. **mesh 渲染散架**：MuJoCo 编译时将 mesh 顶点重新居中并折叠进
-   `geom_pos/mesh_pos/mesh_quat`；three.js 直接加载原始 STL 时必须按
-   `X_geom ∘ M⁻¹` 补偿，否则每个部件偏移 0.2~0.4m。
+2. **mesh 渲染散架（两代修复）**：MuJoCo 编译时将 mesh 顶点重新居中并折叠进
+   `geom_pos/mesh_pos/mesh_quat`。第一版用 three.js 加载原始 STL 再手工做
+   `X_geom ∘ M⁻¹` 补偿——手臂部分补偿出错仍然散架。现方案（参照
+   g1-kitchen-web / zalo/mujoco_wasm）：直接从编译后模型的 `model.mesh_vert`
+   / `mesh_face` 缓冲构建几何体并直接施加 `geom_pos/geom_quat`，编译期重居中
+   天然自洽，整类补偿 bug 不复存在。注意：WASM 堆视图 `.slice()` 后必须
+   `new Float32Array(copy)` / `Array.from(faces)` 再交给 three.js（它需要
+   拥有 `byteLength` 的真实 buffer），否则渲染报 createBuffer 错误。
 3. WASM 绑定的缓冲区方法是 `GetView()`（README 写的 `getView` 有误），
    `DoubleBuffer` 构造用 `FromArray`。
 4. 姿态任务误差符号写反 = "反姿态任务"，会把关节推离标称姿态。
@@ -98,10 +103,10 @@ py scripts/serve_web.py 8765
 ```
 web/                     浏览器应用（index.html + js/{main,controller,viewer}.js）
   lib/package/           @mujoco/mujoco WASM 绑定
-  lib/three/             three.js + OrbitControls + STLLoader
-  model/                 自包含场景 XML + STL 网格（供 WASM 虚拟文件系统）
+  lib/three/             three.js + OrbitControls
+  model/                 自包含场景 XML + STL 网格（供 WASM 虚拟文件系统编译；
+                         渲染几何体直接取自编译后模型的 mesh 缓冲，不用 STL）
   gains.json             ZMP 预观控制增益（Kx, kr）
-  model_desc.json        渲染用 body/geom 描述
 scripts/export_web_model.py   生成 web 模型/增益/渲染描述（内联增益计算）
 scripts/serve_web.py     静态服务器（正确 .wasm MIME、no-store）
 scripts/sim_node.mjs     Node 无头回归 harness（与浏览器同一 controller.js）

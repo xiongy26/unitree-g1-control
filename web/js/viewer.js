@@ -14,7 +14,11 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 export class Viewer3D {
   constructor(container, mujoco, model) {
-    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer = new THREE.WebGLRenderer({ antialias: true,
+      // the recorder composites this canvas into the video each frame; without
+      // this flag the drawing buffer is cleared after compositing and the
+      // recording would capture blank frames
+      preserveDrawingBuffer: true });
     this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     this.renderer.setSize(innerWidth, innerHeight);
     this.renderer.shadowMap.enabled = true;

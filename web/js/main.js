@@ -173,6 +173,8 @@ async function main() {
         $('banner').style.display = 'block';
         $('banner').textContent = '跌倒了 —— 点击“重置”重新开始';
       }
+      // while recording, composite this displayed frame into the video
+      if (rec) drawCompositeFrame();
     } catch (e) {
       if (!window._frameErr) {
         window._frameErr = true;
@@ -193,6 +195,206 @@ async function main() {
     viewer.followCam = !viewer.followCam;
     $('btn-cam').textContent = viewer.followCam ? '📷 相机跟随' : '📷 自由视角';
   };
+
+  // -------------------------------------------------------- video recording
+  // Records EXACTLY what the user sees: every displayed frame is composited
+  // onto one canvas (3D view + minimap + all text panels, drawn by
+  // drawCompositeFrame below) and MediaRecorder encodes that canvas,
+  // preferring the browser's MP4/H.264 path (falls back to WebM).
+  const recCanvas = document.createElement('canvas');
+  const recCtx = recCanvas.getContext('2d');
+  window._recCanvas = recCanvas;   // exposed for debugging/testing
+  let rec = null;            // MediaRecorder while recording
+  let recMime = '';
+  let recChunks = [];
+  let recTimer = null;
+  let recT0 = 0;
+
+  function drawCompositeFrame() {
+    const W = innerWidth, H = innerHeight, dpr = Math.min(devicePixelRatio, 2);
+    const pw = Math.round(W * dpr), ph = Math.round(H * dpr);
+    if (recCanvas.width !== pw || recCanvas.height !== ph) {
+      recCanvas.width = pw; recCanvas.height = ph;
+    }
+    const ctx = recCtx;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(viewer.renderer.domElement, 0, 0);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // ---- DOM overlays, repainted to match the page CSS
+    const FONT = '13px "Segoe UI",Arial,"Microsoft YaHei",sans-serif';
+    const roundRect = (x, y, w, h, r) => {
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(x, y, w, h, r);
+      else ctx.rect(x, y, w, h);
+    };
+    const panel = (x, y, w, h) => {
+      ctx.fillStyle = 'rgba(8,12,26,0.72)';
+      ctx.strokeStyle = 'rgba(38,50,90,1)';
+      ctx.lineWidth = 1;
+      roundRect(x, y, w, h, 10); ctx.fill(); ctx.stroke();
+    };
+
+    // title panel (top-left)
+    ctx.font = FONT;
+    const titleLines = $('title').innerText.split('\n');
+    const tlh = 21, tw = Math.max(...titleLines.map((l) => ctx.measureText(l).width));
+    panel(16, 14, tw + 30, 14 + titleLines.length * tlh + 2);
+    ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+    ctx.fillStyle = '#e8eeff';
+    ctx.font = '600 17px "Segoe UI",Arial,sans-serif';
+    ctx.fillText(titleLines[0], 30, 22);
+    ctx.font = FONT;
+    titleLines.slice(1).forEach((l, i) => {
+      const y = 22 + 25 + i * tlh;
+      if (l.includes('Step Length:')) {           // value is highlighted red
+        const head = l.slice(0, l.lastIndexOf(':') + 1);
+        ctx.fillStyle = '#e8eeff'; ctx.fillText(head, 30, y);
+        ctx.fillStyle = '#ff5a5a';
+        ctx.fillText(l.slice(head.length), 30 + ctx.measureText(head).width, y);
+        ctx.fillStyle = '#e8eeff';
+      } else {
+        ctx.fillStyle = l.includes('MuJoCo') ? '#9fb0d8' : '#e8eeff';
+        ctx.fillText(l, 30, y);
+      }
+    });
+
+    // control panel (top-right): buttons + parameter fields, 2-row wrap
+    const btns = [...document.querySelectorAll('#ctrl button')];
+    const fields = [...document.querySelectorAll('#ctrl label')];
+    ctx.font = FONT;
+    const btnW = btns.map((b) => ctx.measureText(b.textContent).width + 28);
+    const fldW = fields.map((f) => ctx.measureText(f.childNodes[0].textContent).width + 4 + 64);
+    const rows = [[]];
+    let rowW = 0;
+    const lay = btns.map((b, i) => ({ kind: 'b', i, w: btnW[i] }))
+      .concat(fields.map((f, i) => ({ kind: 'f', i, w: fldW[i] })));
+    for (const it of lay) {
+      if (rowW + it.w > 420 && rows[rows.length - 1].length) { rows.push([]); rowW = 0; }
+      rows[rows.length - 1].push(it);
+      rowW += it.w + 8;
+    }
+    const cw = Math.max(...rows.map((r) => r.reduce((a, it) => a + it.w + 8, 0)));
+    const ch = rows.length * 28 + (rows.length - 1) * 8;
+    const cx0 = W - 16 - cw - 28, cy0 = 14;
+    panel(cx0, cy0, cw + 28, ch + 20);
+    rows.forEach((row, ri) => {
+      let x = cx0 + 14;
+      const y = cy0 + 10 + ri * 36;
+      for (const it of row) {
+        if (it.kind === 'b') {
+          const b = btns[it.i];
+          ctx.fillStyle = b.classList.contains('rec') ? '#8f2727' : '#274b8f';
+          roundRect(x, y, it.w, 28, 6); ctx.fill();
+          ctx.fillStyle = '#fff';
+          ctx.fillText(b.textContent, x + 14, y + 7);
+        } else {
+          const f = fields[it.i];
+          ctx.fillStyle = '#9fb0d8';
+          ctx.font = '12px "Segoe UI",Arial,sans-serif';
+          ctx.fillText(f.childNodes[0].textContent, x, y + 8);
+          ctx.font = FONT;
+          const bx = x + it.w - 64;
+          ctx.fillStyle = '#141c33';
+          ctx.strokeStyle = '#2a3a66';
+          roundRect(bx, y, 64, 26, 6); ctx.fill(); ctx.stroke();
+          ctx.fillStyle = '#e8eeff';
+          ctx.fillText(f.querySelector('input').value, bx + 6, y + 7);
+        }
+        x += it.w + 8;
+      }
+    });
+
+    // minimap (right, under the controls)
+    ctx.drawImage(minimap, W - 16 - minimap.width, 96);
+
+    // status panel (bottom-left)
+    ctx.font = FONT;
+    const statusLines = statusEl.textContent.split('\n');
+    const sw = Math.max(...statusLines.map((l) => ctx.measureText(l).width));
+    const sh = statusLines.length * 20 + 16;
+    panel(16, H - 14 - sh, sw + 28, sh);
+    ctx.fillStyle = '#8fe08f';
+    statusLines.forEach((l, i) => ctx.fillText(l, 30, H - 14 - sh + 10 + i * 20));
+
+    // legend (bottom-right)
+    const legendRows = [...document.querySelectorAll('#legend div')];
+    const legendSw = ['#40ff50', '#ffffff', '#ffd24a'];
+    ctx.font = FONT;
+    const lw = Math.max(...legendRows.map((r) => ctx.measureText(r.textContent).width)) + 30;
+    const lh = legendRows.length * 21 + 16;
+    const lx = W - 16 - lw, ly = H - 14 - lh;
+    panel(lx, ly, lw + 4, lh);
+    legendRows.forEach((r, i) => {
+      const y = ly + 10 + i * 21;
+      if (i < legendSw.length) {
+        ctx.fillStyle = legendSw[i];
+        roundRect(lx + 14, y + 7, 18, 3, 2); ctx.fill();
+      }
+      ctx.fillStyle = '#9fb0d8';
+      ctx.fillText(r.textContent, lx + 40, y);
+    });
+
+    // fall banner
+    const banner = $('banner');
+    if (banner.style.display === 'block') {
+      ctx.font = '700 26px "Segoe UI",Arial,sans-serif';
+      ctx.fillStyle = '#ffd25a';
+      ctx.textAlign = 'center';
+      ctx.fillText(banner.textContent, W / 2, H * 0.38);
+      ctx.textAlign = 'left';
+    }
+
+    // blinking REC dot
+    if (Math.floor((performance.now() - recT0) / 600) % 2 === 0) {
+      ctx.fillStyle = '#ff4040';
+      ctx.beginPath(); ctx.arc(W - 24, H - 8, 5, 0, 7); ctx.fill();
+    }
+  }
+
+  function toggleRecording() {
+    if (!rec) {
+      // prefer MP4/H.264; some browsers only mux WebM — the extension follows
+      for (const c of ['video/mp4;codecs=avc1.42E01E', 'video/mp4;codecs=avc1',
+                       'video/mp4', 'video/webm;codecs=vp9', 'video/webm']) {
+        if (MediaRecorder.isTypeSupported(c)) { recMime = c; break; }
+      }
+      recCanvas.width = Math.round(innerWidth * Math.min(devicePixelRatio, 2));
+      recCanvas.height = Math.round(innerHeight * Math.min(devicePixelRatio, 2));
+      rec = new MediaRecorder(recCanvas.captureStream(30), {
+        mimeType: recMime || undefined, videoBitsPerSecond: 8_000_000,
+      });
+      recChunks = [];
+      rec.ondataavailable = (e) => { if (e.data.size) recChunks.push(e.data); };
+      rec.onstop = () => {
+        const ext = recMime.startsWith('video/mp4') ? 'mp4' : 'webm';
+        const blob = new Blob(recChunks, { type: recMime || 'video/webm' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `g1_walk_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.${ext}`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        window._lastRecording = { size: blob.size, ms: Math.round(performance.now() - recT0), ext };
+      };
+      rec.start(250);
+      const t0 = recT0 = performance.now();
+      $('btn-rec').classList.add('rec');
+      const tick = () => {
+        if (!rec) return;
+        $('btn-rec').textContent = `⏹ 停止录制 ${((performance.now() - t0) / 1000).toFixed(0)}s`;
+      };
+      tick();
+      recTimer = setInterval(tick, 500);
+    } else {
+      rec.stop();
+      rec = null;
+      clearInterval(recTimer);
+      $('btn-rec').textContent = '⏺ 录制';
+      $('btn-rec').classList.remove('rec');
+    }
+  }
+  $('btn-rec').onclick = toggleRecording;
 
   // first boot
   buildController();

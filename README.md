@@ -1,11 +1,14 @@
 # Unitree G1 · ZMP-based Walking in MuJoCo（浏览器 WebAssembly 版）
 
 在 **浏览器里** 用 MuJoCo WebAssembly + three.js 实现 Unitree G1 人形机器人的
-ZMP 预观控制行走 —— 复现参考视频《ZMP-based Walking with Weighted
-Whole-Body Control》的技术路线：
+ZMP 行走 —— 复现参考视频《ZMP-based Walking with Weighted
+Whole-Body Control》的技术路线，并新增 **LIPM-ZMP 线性 MPC** 作为可切换的
+CoM 轨迹生成器：
 
 ```
-足步规划器  →  ZMP 参考轨迹  →  ZMP 预观控制 (Kajita 2003, cart-table LQR)
+足步规划器  →  ZMP 参考轨迹  →  CoM 轨迹生成【二选一，UI 下拉框切换】
+    ├─ ZMP 预观控制 (Kajita 2003, cart-table LQR)    —— 默认
+    └─ LIPM-ZMP 线性 MPC (Wieber 2006 / Herdt 2010)  —— 支撑域约束滚动时域 QP
     →  CoM 轨迹  →  加权全身逆向运动学 (weighted whole-body IK)  →  位置执行器
 ```
 
@@ -28,7 +31,13 @@ py scripts/serve_web.py 8765
   **按真实时间 1:1 推进**（物理步数由墙钟节流，见 main.js 的 ticker）
 - **绿色折线** = 规划 ZMP 参考（支撑脚序列），**白色曲线** = 实际 CoM 轨迹，
   **黄点** = 落脚点，右下角为俯视图分析面板
-- **参数面板**：步数 / 步长 / 单支撑时长 / 双支撑时长随时可改，点击"重置"生效
+- **参数面板**：步数 / 步长 / 单支撑时长 / 双支撑时长 / 控制器（ZMP 预观 或
+  MPC）随时可改，点击"重置"生效
+- **⬅推 / 推➡ 按钮**：行走中施加 40N×0.15s 的侧向推力（质心速度变化约
+  0.17 m/s，在两种模式的恢复包络内；连点可叠加超出包络）——MPC 与预观
+  控制的差异主要在扰动恢复时可见（名义行走时两者指令几乎重合）
+- **橙色曲线**（MPC 模式）= MPC 在俯视图上画出的未来 1.6s 预测 ZMP 轨迹，
+  恢复过程中可以看到它贴着支撑域边缘走
 - **暂停 / 相机跟随 / 拖拽视角 / 滚轮缩放**
 - **⏺ 录制**：把 3D 视口实时录成 WebM 视频并自动下载（MediaRecorder 采集
   WebGL 画布，30fps / 8Mbps）。点击开始（按钮变红并显示时长），再点一次
@@ -41,6 +50,9 @@ py scripts/serve_web.py 8765
 | `GaitPlan` | 足步序列（步长 = 相邻落脚点间距）、相位时间轴（init-DS → SS → DS → … → final-DS）、ZMP 参考（SS 相位位于支撑脚中心，DS 相位 smoothstep 过渡）、摆动腿 minjerk + 正弦抬脚轨迹 |
 | `KajitaPreviewControl` 增益 | cart-table 模型离散化 → 增广状态（CoM 状态 + 未来 ZMP 参考窗）→ DARE 求得状态反馈 `Kx` 与预观增益 `kr`（由 `scripts/export_web_model.py` 用 scipy 预计算，见 `web/gains.json`） |
 | `OnlinePreview.resim` | **滚动时域重预测**：每个 IK 周期从*实测* CoM 状态出发，用预观 LQR 闭环再仿真 cart-table 模型 0.6s。重预测轨迹从实测状态收敛回参考，其与参考的偏差即"当前状态误差沿稳定模态的传播" |
+| `MpcPreview`（MPC 模式） | **LIPM-ZMP 线性 MPC**（Wieber 2006 / Herdt 2010）：决策变量 = 未来 1.6s 的 ZMP 序列（dt=0.04s, N=40），逐点约束在支撑多面体内（SS 取支撑脚矩形、DS 取双脚凸包，留 1.5cm 边距）；CoM 通过线性倒立摆的**精确 ZOH 离散**（cosh/sinh）响应；代价 = 名义 CoM 计划位置+速度跟踪 + 弱 ZMP 跟踪 + ZMP 一阶差分平滑；箱约束 ADMM 求解（M = H+ρI 一次分解复用，每周期 40 次热启动迭代，浏览器内实时） |
+| MPC 命令律 | 与预观控制同构：`cmd = plan(t+lead) + β·(plan(t+lead) − mpcTraj(t+lead))`，钳在 plan±9cm 安全管。**计划承载倒计时深度**（滚动重解从静止状态出发天然偏浅）；MPC 轨迹从实测状态出发且满足支撑域约束，因此修正项是约束感知的。lead x/y = 0.06/0.12，β = 1.2 |
+| 捕获步（MPC 模式） | 推扰后武装 2.5 s 的恢复机制：① `updatePlanClock` 按横向速度误差压缩/拉伸单支撑相位（向摆动侧倒→提前落脚；向支撑侧倒→延长制动），时钟上限放宽至 1.5；② `footTargetsUpdate` 把摆动脚落点向倾倒侧平移至多 5 cm（`plan.footY` 活引用 → ZMP 参考与 MPC 支撑约束自动跟随）；③ 名义 CoM 计划**刻意不**跟随新落点——命令律的 β 项需要未被迁就的计划作为参考，否则修正信号消失 |
 | CoM 目标律 | `cmd = plan(t+lead) + β·(plan(t+lead) − resim(t+lead))`——把重预测偏差**沿参考镜像**（落后→指令超前参考，超前→制动），得到带 LQR 模态整形的位置/速度/加速度负反馈；`lead` 补偿指令→执行的传输滞后（横向经髋滚转滞后更大），偏差限幅在参考周围 ±5cm 的安全管内 |
 | `updatePlanClock` | **自适应步态时钟**：计划时间轴按实测 CoM 矢状进度放慢/加快（rate 0.6~1.3），防止位置执行链滞后使 CoM 与计划脱节 |
 | 触地重定时 | 摆动完成 60% 后一旦摆动脚物理触地，把计划时钟快进到该步 DS 起点，使 ZMP 参考的重量转移与真实接触同步开始（计划 CoM 轨迹跨相位连续，指令无跳变） |
@@ -56,14 +68,39 @@ py scripts/serve_web.py 8765
 | 默认 16 步 × 0.12 m | ≈1.9 m / 14 s | 横向 CoM 误差 < 9 cm，全程稳定 |
 | 极限 | 24 步以上 | 收尾阶段累积失稳跌倒 |
 
+**MPC 模式包络**（同一 harness、`--ctrl mpc`；结果为 12 个用例的扫描）：
+
+| 用例 | ZMP 预观 | MPC |
+| --- | --- | --- |
+| 8 步 × {0.10, 0.12} × {0.3, 0.4} s | 全部 PASS | 全部 PASS，且跟踪误差普遍更低（如 8×0.10×0.4：横 3.3/矢 7.2 cm vs 2.8/9.4 cm） |
+| 16 / 20 步 × 0.12 m × 0.4 s | PASS | PASS（16 步 13.5 s、20 步 16.4 s 走完） |
+| 16 / 20 步 × 0.10 m × 0.4 s | 16 步 PASS；**20 步 12.1 s 失稳** | 全部 PASS——**20 步用例 MPC 更优**（15.4 s 走完，横 8.0 cm） |
+| 快速步态（单支撑 0.3 s） | 全部 FAIL | 全部 FAIL——单支撑过短是位置执行链的固有限制，与 CoM 生成器无关 |
+
+**侧向推扰对比**（`--push F,dur,t0`，默认步态）——名义行走时两模式指令几乎
+重合（MPC 的命令律本就沿用预观控制的形式），差异在扰动恢复时显现。MPC 模式
+额外带**捕获步机制**（推扰后武装 2.5 s：横向速度误差压缩/拉伸单支撑相位 +
+摆动脚落点向倾倒侧平移至多 5 cm，ZMP 参考与 MPC 支撑约束自动跟随新落点）：
+
+| 推扰 | ZMP 预观 | MPC（含捕获步） |
+| --- | --- | --- |
+| 30 N × 0.15 s @ 2.5 / 3.0 / 3.25 s | @3.0 时 8.1 s 摔倒 | **三个时机全部恢复走完** |
+| 50 N × 0.15 s @ 3.0 s | 4.9 s 摔倒 | **13.8 s 走完** |
+| 60–70 N × 0.15 s | 摔倒 | 摔倒（固定落脚点架构的共同边界；完整恢复需落脚点自适应重规划） |
+
+注意：捕获步机制只在真实推扰后武装——名义摇摆的偏差与中等推扰同量级，
+不加门槛的捕获逻辑会破坏名义步态。
+
 步态质量：摆动脚实际离地约 **5 cm**（目标 10 cm，IK 加权折衷 + 位置执行器
 滞后各吃掉一半；进一步提高摆动权重/增益会进入 IK-执行器闭环的不稳定区），
 矢状向 CoM 跟踪误差 < 12 cm，行进距离约为计划的 85-95%。
 
 - 已知局限：步长 ≥ 0.14 m、单支撑 ≥ 0.5 s、或 24 步以上的超长行走会失稳。
 - `scripts/sim_node.mjs` 是无头回归 harness：`node scripts/sim_node.mjs
-  [--steps N] [--len L] [--ss T] [--ds T]`，用与浏览器完全相同的
-  controller.js + 模型做快速定量验证，输出 PASS/FAIL。
+  [--steps N] [--len L] [--ss T] [--ds T] [--ctrl zmp|mpc] [--push F,dur,t0]
+  [--mpcleadx T] [--mpcleady T] [--mpcbeta B] [--mpctube M] [--mpcqcom Q]
+  [--mpcqvel Q] [--mpcq Q] [--mpcr R] [--mpcmargin M] [--mpciter N]`，用与
+  浏览器完全相同的 controller.js + 模型做快速定量验证，输出 PASS/FAIL。
 
 ## 调试过程中修掉的关键 bug（备忘）
 
@@ -100,6 +137,12 @@ py scripts/serve_web.py 8765
   [ekorudiawan/ZMP-Preview-Control-WPG](https://github.com/ekorudiawan/ZMP-Preview-Control-WPG)、
   [zanppa/WPG](https://github.com/zanppa/WPG)、
   [rdesarz/lipm-walking-controller](https://github.com/rdesarz/lipm-walking-controller)
+- MPC 模式：Wieber 2006《Trajectory Free Linear Model Predictive Control for
+  Stable Walking in the Presence of Strong Perturbations》、
+  Herdt et al. 2010《Iterative Predictive Control for Stable Interleaved
+  Walking and Push Recovery》——决策变量取未来 ZMP 序列 + 支撑域约束的
+  标准形式；[stephane-caron/lipm_walking_controller](https://github.com/stephane-caron/lipm_walking_controller)
+  是同一思路的完整实现参考
 
 ## 目录结构
 
@@ -109,10 +152,15 @@ web/                     浏览器应用（index.html + js/{main,controller,view
   lib/three/             three.js + OrbitControls
   model/                 自包含场景 XML + STL 网格（供 WASM 虚拟文件系统编译；
                          渲染几何体直接取自编译后模型的 mesh 缓冲，不用 STL）
-  gains.json             ZMP 预观控制增益（Kx, kr）
+  gains.json             ZMP 预观控制增益（Kx, kr；MPC 复用其中的 zc/g）
 scripts/export_web_model.py   生成 web 模型/增益/渲染描述（内联增益计算）
 scripts/serve_web.py     静态服务器（正确 .wasm MIME、no-store）
-scripts/sim_node.mjs     Node 无头回归 harness（与浏览器同一 controller.js）
+scripts/sim_node.mjs     Node 无头回归 harness（与浏览器同一 controller.js；
+                         --ctrl zmp|mpc 选择 CoM 轨迹生成器）
 models/g1_walk.xml       G1 模型源（足底摩擦 1.2、执行器增强版 kp=1600）
 third_party/mujoco_menagerie   上游模型资产（仅 meshes 被引用）
 ```
+
+web/js/controller.js 导出：`GaitPlan`（足步规划，两模式共用）、
+`OnlinePreview`（Kajita 预观控制，默认）、`MpcPreview`（LIPM-ZMP 线性 MPC）、
+`WalkingController`（加权全身 IK + 状态机，经 `params.controller` 分派）。

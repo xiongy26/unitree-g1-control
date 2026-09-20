@@ -8,6 +8,12 @@ const params = {
   nSteps: 16, stepLength: 0.12, tInit: 1.0, tSS: 0.4, tDS: 0.10, tFinal: 1.0,
   extraHold: 0.5, swingHeight: 0.10, footCenterDx: 0.035, stanceInset: 0.02,
   firstSwing: 'left',
+  // CoM trajectory generator: 'zmp' (Kajita preview control) | 'mpc'
+  // (LIPM-ZMP linear MPC, see MpcPreview in controller.js)
+  controller: 'zmp',
+  mpcDt: 0.04, mpcHorizon: 1.6, mpcQCom: 10.0, mpcQVel: 10.0, mpcQZmp: 0.2,
+  mpcR: 1e-2, mpcFootMargin: 0.015, mpcLeadX: 0.06, mpcLeadY: 0.12,
+  mpcFeedback: 1.2, mpcTube: 0.09, mpcAdmmIters: 40,
   ikRate: 8, ikDamping: 1e-3, ikGain: 0.12, kneeMin: 0.4, horizonSteps: 80,
   crouchHip: -0.3, crouchKnee: 0.6, crouchAnkle: -0.3,
   dropTime: 0.8, settleTime: 1.5, tube: 0.04,
@@ -93,6 +99,7 @@ async function main() {
     params.stepLength = parseFloat($('in-len').value) || 0.12;
     params.tSS = parseFloat($('in-ss').value) || 0.4;
     params.tDS = parseFloat($('in-ds').value) || 0.1;
+    params.controller = $('in-ctrl').value === 'mpc' ? 'mpc' : 'zmp';
     $('t-ss').textContent = params.tSS;
     $('t-ds').textContent = params.tDS;
     $('t-len').textContent = `${params.stepLength} m`;
@@ -166,7 +173,8 @@ async function main() {
         : '--';
       statusEl.textContent =
         `t = ${tp.toFixed(2)} s   阶段 = ${ph ? ph.kind : '-'}   ` +
-        `步态周期 ${params.tSS + params.tDS} s\n` +
+        `步态周期 ${params.tSS + params.tDS} s   控制器 = ` +
+        `${params.controller === 'mpc' ? 'MPC' : 'ZMP 预观'}\n` +
         `CoP 误差 = ${zerr} cm   步数 = ${ctrl.plan ? ctrl.plan.steps.length : 0}\n` +
         `状态: ${ctrl.status}${paused ? ' (已暂停)' : ''}`;
       if (ctrl.fell) {
@@ -191,6 +199,18 @@ async function main() {
     reanchorTicker();
   };
   $('btn-reset').onclick = resetSim;
+  // lateral push disturbances — the standard probe for walking robustness.
+  // 40 N ≈ 0.17 m/s CoM velocity change: inside both controllers' recovery
+  // envelope (MPC demonstrably recovers where preview control sometimes
+  // falls); each click adds another push, so repeated clicks escalate past
+  // the envelope (~50 N single / more when repeated) and topple either mode
+  const PUSH_N = 40, PUSH_S = 0.15;
+  $('btn-pushl').onclick = () => {
+    if (ctrl && ctrl.status === 'walking') ctrl.applyPush(-PUSH_N, PUSH_S);
+  };
+  $('btn-pushr').onclick = () => {
+    if (ctrl && ctrl.status === 'walking') ctrl.applyPush(PUSH_N, PUSH_S);
+  };
   $('btn-cam').onclick = () => {
     viewer.followCam = !viewer.followCam;
     $('btn-cam').textContent = viewer.followCam ? '📷 相机跟随' : '📷 自由视角';
@@ -259,16 +279,19 @@ async function main() {
       }
     });
 
-    // control panel (top-right): buttons + parameter fields, 2-row wrap
+    // control panel (top-right): buttons + parameter fields + selects, 2-row wrap
     const btns = [...document.querySelectorAll('#ctrl button')];
     const fields = [...document.querySelectorAll('#ctrl label')];
+    const sels = [...document.querySelectorAll('#ctrl select')];
     ctx.font = FONT;
     const btnW = btns.map((b) => ctx.measureText(b.textContent).width + 28);
     const fldW = fields.map((f) => ctx.measureText(f.childNodes[0].textContent).width + 4 + 64);
+    const selW = sels.map((s) => ctx.measureText(s.selectedOptions[0].textContent).width + 24);
     const rows = [[]];
     let rowW = 0;
     const lay = btns.map((b, i) => ({ kind: 'b', i, w: btnW[i] }))
-      .concat(fields.map((f, i) => ({ kind: 'f', i, w: fldW[i] })));
+      .concat(fields.map((f, i) => ({ kind: 'f', i, w: fldW[i] })))
+      .concat(sels.map((s, i) => ({ kind: 's', i, w: selW[i] })));
     for (const it of lay) {
       if (rowW + it.w > 420 && rows[rows.length - 1].length) { rows.push([]); rowW = 0; }
       rows[rows.length - 1].push(it);
@@ -288,6 +311,13 @@ async function main() {
           roundRect(x, y, it.w, 28, 6); ctx.fill();
           ctx.fillStyle = '#fff';
           ctx.fillText(b.textContent, x + 14, y + 7);
+        } else if (it.kind === 's') {
+          const s = sels[it.i];
+          ctx.fillStyle = '#141c33';
+          ctx.strokeStyle = '#2a3a66';
+          roundRect(x, y, it.w, 26, 6); ctx.fill(); ctx.stroke();
+          ctx.fillStyle = '#e8eeff';
+          ctx.fillText(s.selectedOptions[0].textContent, x + 8, y + 7);
         } else {
           const f = fields[it.i];
           ctx.fillStyle = '#9fb0d8';
@@ -306,7 +336,7 @@ async function main() {
     });
 
     // minimap (right, under the controls)
-    ctx.drawImage(minimap, W - 16 - minimap.width, 96);
+    ctx.drawImage(minimap, W - 16 - minimap.width, 168);
 
     // status panel (bottom-left)
     ctx.font = FONT;
@@ -319,7 +349,7 @@ async function main() {
 
     // legend (bottom-right)
     const legendRows = [...document.querySelectorAll('#legend div')];
-    const legendSw = ['#40ff50', '#ffffff', '#ffd24a'];
+    const legendSw = ['#40ff50', '#ffffff', '#ffd24a', '#ffa030'];
     ctx.font = FONT;
     const lw = Math.max(...legendRows.map((r) => ctx.measureText(r.textContent).width)) + 30;
     const lh = legendRows.length * 21 + 16;
@@ -457,6 +487,17 @@ function drawMinimap(ctx, ctrl, canvas) {
     const [x, y] = px(ctrl.zmpMeas[0], ctrl.zmpMeas[1]);
     ctx.fillStyle = '#ff5a5a';
     ctx.beginPath(); ctx.arc(x, y, 6, 0, 7); ctx.fill();
+  }
+  // MPC predicted ZMP over the horizon (orange) — shows the planning
+  // process: in recovery the prediction hugs the support-polygon edge
+  if (ctrl.preview && ctrl.preview.axes) {
+    ctx.strokeStyle = '#ffa030'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let k = 0; k < ctrl.preview.N; k++) {
+      const [x, y] = px(ctrl.preview.axes[0].zmp[k], ctrl.preview.axes[1].zmp[k]);
+      if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
   }
   ctx.fillStyle = '#9fb0d8';
   ctx.font = '11px sans-serif';

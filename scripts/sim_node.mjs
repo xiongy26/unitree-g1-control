@@ -3,6 +3,9 @@
 //
 // Usage:
 //   node scripts/sim_node.mjs [--steps N] [--len L] [--ss T] [--ds T]
+//                             [--ctrl zmp|mpc] [--mpcdt T] [--mpchor T]
+//                             [--mpcq Q] [--mpcr R] [--mpcmargin M]
+//                             [--mpclead T] [--mpciter N]
 //                             [--log-every T] [--quiet] [--dump FILE]
 //
 // Prints a per-phase summary and an overall PASS/FAIL verdict.
@@ -31,6 +34,20 @@ const params = {
   tInit: 1.0, tSS: parseFloat(argVal('--ss', 0.4)), tDS: parseFloat(argVal('--ds', 0.10)),
   tFinal: 1.0, extraHold: 0.5, swingHeight: parseFloat(argVal('--sh', 0.10)), footCenterDx: 0.035,
   stanceInset: 0.02, firstSwing: 'left',
+  // CoM generator: 'zmp' (preview control) | 'mpc' (LIPM-ZMP linear MPC)
+  controller: argVal('--ctrl', 'zmp') === 'mpc' ? 'mpc' : 'zmp',
+  mpcDt: parseFloat(argVal('--mpcdt', 0.04)),
+  mpcHorizon: parseFloat(argVal('--mpchor', 1.6)),
+  mpcQCom: parseFloat(argVal('--mpcqcom', 10.0)),
+  mpcQVel: parseFloat(argVal('--mpcqvel', 10.0)),
+  mpcQZmp: parseFloat(argVal('--mpcq', 0.2)),
+  mpcR: parseFloat(argVal('--mpcr', 1e-2)),
+  mpcFootMargin: parseFloat(argVal('--mpcmargin', 0.015)),
+  mpcLeadX: parseFloat(argVal('--mpcleadx', 0.06)),
+  mpcLeadY: parseFloat(argVal('--mpcleady', 0.12)),
+  mpcFeedback: parseFloat(argVal('--mpcbeta', 1.2)),
+  mpcTube: parseFloat(argVal('--mpctube', 0.09)),
+  mpcAdmmIters: parseInt(argVal('--mpciter', 40)),
   ikRate: 8, ikDamping: 1e-3, ikGain: parseFloat(argVal('--ikgain', 0.12)),
   kneeMin: parseFloat(argVal('--kneemin', 0.4)), horizonSteps: 80,
   crouchHip: -0.3, crouchKnee: 0.6, crouchAnkle: -0.3,
@@ -56,6 +73,12 @@ const params = {
 };
 const logEvery = parseFloat(argVal('--log-every', 0.1));
 const quiet = has('--quiet');
+// lateral push disturbance: --push F[,dur[,t0]]  (Newtons, seconds, start time)
+const pushArg = argVal('--push', '');
+const pushParts = pushArg ? pushArg.split(',').map(Number) : [];
+const pushF = pushParts[0] || 0;
+const pushDur = pushParts[1] ?? 0.15;
+const pushAt = pushParts[2] ?? 3.0;
 
 // ------------------------------------------------------------- load mujoco
 const mujoco = await loadMujoco({
@@ -141,8 +164,18 @@ function record() {
 
 // settle already ran inside reset(); now walk
 let nextLog = 0;
+let pushed = false;
+let maxDevAfterPush = 0;
 while (!ctrl.fell && !ctrl.done) {
   ctrl.stepPhysics();
+  if (pushF && !pushed && ctrl.t >= pushAt) {
+    ctrl.applyPush(pushF, pushDur);
+    pushed = true;
+  }
+  if (pushed && isFinite(ctrl.zmpMeas[1])) {
+    const dev = Math.abs(ctrl.com()[1] - ctrl.plan.zmpRef(ctrl.tPlan ?? ctrl.t)[1]);
+    maxDevAfterPush = Math.max(maxDevAfterPush, dev);
+  }
   if (ctrl.t >= nextLog) { record(); nextLog += logEvery; }
   if (ctrl.fell || ctrl.done) break;
 }
@@ -152,7 +185,8 @@ record();
 const nSS = [...perPhase.keys()].length;
 const completedSS = nSS - (ctrl.fell && ctrl.status === 'FELL' ? 1 : 0);
 console.log('== headless walk ==');
-console.log(`params: ${params.nSteps} steps, len ${params.stepLength}, SS ${params.tSS}s, DS ${params.tDS}s, ikGain ${params.ikGain}`);
+console.log(`params: controller=${params.controller} ${params.nSteps} steps, len ${params.stepLength}, SS ${params.tSS}s, DS ${params.tDS}s, ikGain ${params.ikGain}` +
+  (pushF ? ` push=${pushF}N×${pushDur}s@${pushAt}s` : ''));
 console.log(`result: status=${ctrl.status} t=${ctrl.t.toFixed(2)}s fell=${ctrl.fell} ` +
   `ss-phases-entered=${nSS} planned-steps=${ctrl.plan.steps.length}`);
 console.log(`tracking: max|com_y-plan_y|=${(maxLatErr * 100).toFixed(2)}cm ` +

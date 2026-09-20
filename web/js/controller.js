@@ -1,9 +1,12 @@
-// Gait planner + online ZMP preview control + weighted whole-body IK,
-// ported from the Python implementation (g1_zmp_walking/).
+// Gait planner + [online ZMP preview control | LIPM-ZMP linear MPC] +
+// weighted whole-body IK, ported from the Python implementation
+// (g1_zmp_walking/).
 //
 // References:
 //  - Kajita et al. 2003, "ZMP-based walking with preview control"
 //  - github.com/chauby/ZMP_preview_control, github.com/zanppa/WPG
+//  - MPC: Wieber 2006 / Herdt et al. 2010, predictive control of the linear
+//    inverted pendulum with ZMP-inside-support-polygon constraints
 //  - Weighted IK: github.com/kevinzakka/mink (same weighted-task formulation)
 
 // ---------------------------------------------------------------- utils
@@ -64,6 +67,49 @@ function solveLinear(H, g, n) { // Gaussian elimination w/ partial pivot
     x[r] = Math.abs(A[r * n + r]) < 1e-12 ? 0 : s / A[r * n + r];
   }
   return x;
+}
+
+// LU factorization with partial pivoting (in place, row-major), returning
+// the pivot permutation. luSolve then applies it: one O(n²) triangular
+// solve per right-hand side — used by the MPC whose KKT matrix is constant
+// across all solves of a walk.
+function luFactor(M, n) {
+  const piv = new Int32Array(n);
+  for (let i = 0; i < n; i++) piv[i] = i;
+  for (let k = 0; k < n; k++) {
+    let p = k, mx = Math.abs(M[k * n + k]);
+    for (let i = k + 1; i < n; i++) {
+      const v = Math.abs(M[i * n + k]);
+      if (v > mx) { mx = v; p = i; }
+    }
+    if (p !== k) {
+      for (let j = 0; j < n; j++) {
+        const t = M[k * n + j]; M[k * n + j] = M[p * n + j]; M[p * n + j] = t;
+      }
+      const tp = piv[k]; piv[k] = piv[p]; piv[p] = tp;
+    }
+    const d = M[k * n + k];
+    for (let i = k + 1; i < n; i++) {
+      const f = M[i * n + k] / d;
+      M[i * n + k] = f;
+      if (f !== 0) for (let j = k + 1; j < n; j++) M[i * n + j] -= f * M[k * n + j];
+    }
+  }
+  return piv;
+}
+function luSolve(M, piv, n, b, out) {
+  for (let i = 0; i < n; i++) out[i] = b[piv[i]];
+  for (let i = 1; i < n; i++) {
+    let s = out[i];
+    for (let j = 0; j < i; j++) s -= M[i * n + j] * out[j];
+    out[i] = s;
+  }
+  for (let i = n - 1; i >= 0; i--) {
+    let s = out[i];
+    for (let j = i + 1; j < n; j++) s -= M[i * n + j] * out[j];
+    out[i] = s / M[i * n + i];
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- gait
@@ -168,6 +214,49 @@ export class GaitPlan {
 }
 
 // ------------------------------------------------- online preview control
+// Shared by both CoM generators: sample the ZMP reference at the preview
+// dt and roll the preview-LQR closed-loop cart-table forward from rest —
+// the canonical nominal CoM plan of this project (used by updatePlanClock
+// pacing and by the headless tracking metrics).
+function buildNominalPlan(gains, plan, tEnd) {
+  const dt = gains.dt, nPrev = gains.n_prev;
+  const Kx = gains.Kx, kr = gains.kr;
+  // reference sampled at preview dt, padded at the end
+  const nRef = Math.round((tEnd + 2.0) / dt) + 1;
+  const refX = new Float64Array(nRef + nPrev + 2);
+  const refY = new Float64Array(nRef + nPrev + 2);
+  for (let k = 0; k < nRef; k++) {
+    const r = plan.zmpRef(k * dt);
+    refX[k] = r[0]; refY[k] = r[1];
+  }
+  for (let k = nRef; k < refX.length; k++) {
+    refX[k] = refX[nRef - 1]; refY[k] = refY[nRef - 1];
+  }
+  // offline closed-loop plan (for the analysis panel & target tube)
+  const nPlan = Math.round(tEnd / dt) + 1;
+  const planT = new Float64Array(nPlan);
+  const planX = new Float64Array(nPlan);
+  const planY = new Float64Array(nPlan);
+  const kMax = refX.length - nPrev - 1;
+  const dotRef = (ref, k) => {
+    let s = 0;
+    for (let i = 0; i < nPrev; i++) s += kr[i] * ref[k + i];
+    return s;
+  };
+  let sx = refX[0], svx = 0, sax = 0;
+  let sy = refY[0], svy = 0, say = 0;
+  for (let k = 0; k < nPlan; k++) {
+    planT[k] = k * dt;
+    planX[k] = sx; planY[k] = sy;
+    const kx = Math.min(k, kMax);
+    const ux = -(Kx[0] * sx + Kx[1] * svx + Kx[2] * sax) - dotRef(refX, kx);
+    const uy = -(Kx[0] * sy + Kx[1] * svy + Kx[2] * say) - dotRef(refY, kx);
+    sax += ux * dt; svx += sax * dt; sx += svx * dt;
+    say += uy * dt; svy += say * dt; sy += svy * dt;
+  }
+  return { dt, refX, refY, planT, planX, planY };
+}
+
 export class OnlinePreview {
   // gains: {Kx[3], kr[N], dt, n_prev, zc}
   constructor(gains, plan, tEnd, resimWindow = 0.6) {
@@ -177,36 +266,10 @@ export class OnlinePreview {
     this.nPrev = gains.n_prev;
     this.zc = gains.zc;
     this.g = 9.81;
-    // reference sampled at preview dt, padded at the end
-    const nRef = Math.round((tEnd + 2.0) / this.dt) + 1;
-    this.refX = new Float64Array(nRef + this.nPrev + 2);
-    this.refY = new Float64Array(nRef + this.nPrev + 2);
-    for (let k = 0; k < nRef; k++) {
-      const r = plan.zmpRef(k * this.dt);
-      this.refX[k] = r[0]; this.refY[k] = r[1];
-    }
-    for (let k = nRef; k < this.refX.length; k++) {
-      this.refX[k] = this.refX[nRef - 1]; this.refY[k] = this.refY[nRef - 1];
-    }
-    // offline closed-loop plan (for the analysis panel & target tube)
-    const nPlan = Math.round(tEnd / this.dt) + 1;
-    this.planT = new Float64Array(nPlan);
-    this.planX = new Float64Array(nPlan);
-    this.planY = new Float64Array(nPlan);
-    let sx = this.refX[0], svx = 0, sax = 0;
-    let sy = this.refY[0], svy = 0, say = 0;
-    const A = [1, this.dt, 0.5 * this.dt * this.dt];
-    for (let k = 0; k < nPlan; k++) {
-      this.planT[k] = k * this.dt;
-      this.planX[k] = sx; this.planY[k] = sy;
-      const kx = Math.min(k, this.refX.length - this.nPrev - 1);
-      const ux = -(this.Kx[0] * sx + this.Kx[1] * svx + this.Kx[2] * sax)
-        - this.dotRef(this.kr, this.refX, kx);
-      const uy = -(this.Kx[0] * sy + this.Kx[1] * svy + this.Kx[2] * say)
-        - this.dotRef(this.kr, this.refY, kx);
-      sax += ux * this.dt; svx += sax * this.dt; sx += svx * this.dt;
-      say += uy * this.dt; svy += say * this.dt; sy += svy * this.dt;
-    }
+    const nominal = buildNominalPlan(gains, plan, tEnd);
+    this.refX = nominal.refX; this.refY = nominal.refY;
+    this.planT = nominal.planT;
+    this.planX = nominal.planX; this.planY = nominal.planY;
     // receding-horizon re-simulation buffers (stabilized closed-loop from
     // the measured CoM state; see resim())
     this.nW = Math.max(2, Math.round(resimWindow / this.dt));
@@ -270,6 +333,214 @@ export class OnlinePreview {
   }
 }
 
+// ------------------------------------------------- LIPM-ZMP linear MPC
+// Receding-horizon CoM trajectory generation (Wieber 2006 / Herdt 2010
+// family). The DECISION VARIABLE is the future ZMP sequence over a ~1.6 s
+// horizon — constrained pointwise to the support polygon (SS: support-foot
+// rectangle, DS/init/final: both-feet hull) — and the CoM follows through
+// the EXACT zero-order-hold discretization of the linear inverted pendulum
+// (c̈ = ω²(c − p)). The objective tracks the canonical nominal CoM plan
+// (position AND velocity — without the velocity term the divergent LIPM
+// mode hides excess sway speed behind an on-reference position) plus a
+// weak ZMP-reference term, with a first-difference penalty keeping the
+// ZMP smooth. Box constraints on the decision variable itself make the
+// ADMM projection exact and M = H + ρI perfectly conditioned, so the
+// warm-started iterations converge cleanly every cycle; M is factored
+// ONCE per walk. The optimized trajectory starts at the MEASURED state
+// and is both dynamically consistent and constraint-aware — the command
+// law samples it exactly like the preview control's re-simulation.
+export class MpcPreview {
+  // gains: {zc, dt, ...} (dt feeds the nominal plan only), plan: GaitPlan,
+  // zc: measured CoM height from settle(), p: params
+  constructor(gains, plan, tEnd, zc, p) {
+    this.plan = plan;
+    this.zc = zc;
+    this.g = 9.81;
+    // canonical nominal CoM plan (same LQR rollout as OnlinePreview) for
+    // updatePlanClock pacing and the headless tracking metrics
+    const nominal = buildNominalPlan(gains, plan, tEnd);
+    this.dtNom = nominal.dt;
+    this.planT = nominal.planT;
+    this.planX = nominal.planX; this.planY = nominal.planY;
+
+    this.dt = p.mpcDt ?? 0.04;
+    this.N = Math.max(8, Math.round((p.mpcHorizon ?? 1.6) / this.dt));
+    this.qc = p.mpcQCom ?? 10.0;  // CoM position tracking (nominal plan)
+    this.qv = p.mpcQVel ?? 10.0;  // CoM velocity tracking (nominal plan)
+    this.q = p.mpcQZmp ?? 0.2;    // ZMP reference tracking (kept weak)
+    this.r = p.mpcR ?? 1e-2;      // ZMP first-difference (smoothness) weight
+    this.margin = p.mpcFootMargin ?? 0.015;
+    this.iters = p.mpcAdmmIters ?? 40;
+    // foot sole rectangle around the ankle joint (g1_walk.xml foot spheres):
+    // x ∈ [-0.05, 0.12], y ∈ ±0.03; GaitPlan.footCenter() is its midpoint
+    this.halfFootX = 0.085;
+    this.halfFootY = 0.03;
+
+    const N = this.N, dt = this.dt;
+    const w = this.w = Math.sqrt(this.g / zc);   // LIPM eigenfrequency
+    const th = w * dt, ch = this.ch = Math.cosh(th), sh = this.sh = Math.sinh(th);
+    // exact ZOH of c̈ = ω²(c − p) under piecewise-constant p:
+    //   X_{k+1} = Al·X_k + Bl·p_k,  X = [c, ċ]
+    //   Al = [[ch, sh/w], [w·sh, ch]],  Bl = [1 − ch, −w·sh]
+    const Al = [[ch, sh / w], [w * sh, ch]];
+    const Bl = [1 - ch, -w * sh];
+    // Toeplitz kernels of the p → (c, ċ) maps and homogeneous rows e·Al^{k+1}
+    this.kc = new Float64Array(N);
+    this.kv = new Float64Array(N);
+    this.cR = new Float64Array(2 * N);
+    this.vR = new Float64Array(2 * N);
+    let v = [Bl[0], Bl[1]];                 // Al^0·Bl
+    let r1 = [1, 0], r2 = [0, 1];           // e1, e2
+    for (let k = 0; k < N; k++) {
+      this.kc[k] = v[0];
+      this.kv[k] = v[1];
+      const r1n = [r1[0] * ch + r1[1] * w * sh, r1[0] * (sh / w) + r1[1] * ch];
+      const r2n = [r2[0] * ch + r2[1] * w * sh, r2[0] * (sh / w) + r2[1] * ch];
+      this.cR[2 * k] = r1n[0]; this.cR[2 * k + 1] = r1n[1];
+      this.vR[2 * k] = r2n[0]; this.vR[2 * k + 1] = r2n[1];
+      v = [ch * v[0] + (sh / w) * v[1], w * sh * v[0] + ch * v[1]];
+      r1 = r1n; r2 = r2n;
+    }
+    const Kc = new Float64Array(N * N);
+    const Kv = new Float64Array(N * N);
+    for (let i = 0; i < N; i++) {
+      for (let j = 0; j <= i; j++) {
+        Kc[i * N + j] = this.kc[i - j];
+        Kv[i * N + j] = this.kv[i - j];
+      }
+    }
+    this.Kc = Kc; this.Kv = Kv;
+    // Hessian H = 2(qc·KcᵀKc + qv·KvᵀKv + q·I) + 2r·DᵀD   (D = first difference)
+    const H = new Float64Array(N * N);
+    for (let i = 0; i < N; i++) {
+      for (let j = 0; j < N; j++) {
+        let sc = 0, sv = 0;
+        for (let m = 0; m < N; m++) {
+          sc += Kc[m * N + i] * Kc[m * N + j];
+          sv += Kv[m * N + i] * Kv[m * N + j];
+        }
+        H[i * N + j] = 2 * (this.qc * sc + this.qv * sv + (i === j ? this.q : 0));
+      }
+    }
+    for (let i = 0; i < N; i++) {
+      H[i * N + i] += 2 * this.r * (i === 0 || i === N - 1 ? 1 : 2);
+      if (i > 0) {
+        H[i * N + i - 1] -= 2 * this.r;
+        H[(i - 1) * N + i] -= 2 * this.r;
+      }
+    }
+    // ADMM with the box ON the decision variable:
+    //   U ← (H + ρI)⁻¹(−grad + ρ(z − y));  z ← clamp(U + y);  y ← y + U − z
+    const rho = this.rho = 1.0;
+    const M = new Float64Array(N * N);
+    for (let i = 0; i < N * N; i++) M[i] = H[i];
+    for (let i = 0; i < N; i++) M[i * N + i] += rho;
+    this.Mlu = M;
+    this.Mpiv = luFactor(M, N);
+    // per-axis workspaces + warm-start state
+    this.axes = [0, 1].map(() => ({
+      U: new Float64Array(N), z: new Float64Array(N), y: new Float64Array(N),
+      lb: new Float64Array(N), ub: new Float64Array(N), ref: new Float64Array(N),
+      cref: new Float64Array(N), vref: new Float64Array(N),
+      cR0: new Float64Array(N), vR0: new Float64Array(N),
+      grad: new Float64Array(N), rhs: new Float64Array(N),
+      traj: new Float64Array(N + 1), trajV: new Float64Array(N + 1),
+      zmp: new Float64Array(N),
+    }));
+  }
+  planAt(t) { // nominal plan, same semantics as OnlinePreview.planAt
+    const n = this.planT.length;
+    const k = Math.min(Math.max(t / this.dtNom, 0), n - 1.001);
+    const i = Math.floor(k), f = k - i;
+    const j = Math.min(i + 1, n - 1);
+    return [this.planX[i] + (this.planX[j] - this.planX[i]) * f,
+            this.planY[i] + (this.planY[j] - this.planY[i]) * f];
+  }
+  // support-polygon bounds [xlo, xhi, ylo, yhi] at plan-clock time t
+  boundsAt(t) {
+    const hx = this.halfFootX - this.margin, hy = this.halfFootY - this.margin;
+    const ph = this.plan.phaseAt(t);
+    if (ph.kind === 'ss') {
+      const c = this.plan.zmpRef(t);   // SS: the support-foot center
+      return [c[0] - hx, c[0] + hx, c[1] - hy, c[1] + hy];
+    }
+    // init / ds / final: both feet down -> hull of the two sole rectangles
+    const cl = this.plan.footCenter('left', this.plan.footX('left', t));
+    const cr = this.plan.footCenter('right', this.plan.footX('right', t));
+    return [Math.min(cl[0], cr[0]) - hx, Math.max(cl[0], cr[0]) + hx,
+            Math.min(cl[1], cr[1]) - hy, Math.max(cl[1], cr[1]) + hy];
+  }
+  // Re-solve both axis QPs from the measured CoM state. Decision variable
+  // U = ZMP sequence: U[k] holds over [t + k·dt, t + (k+1)·dt); outputs are
+  // sampled at t + (k+1)·dt. Fills traj[0..N] (CoM, traj[0] = measured) —
+  // sample with trajAt().
+  solve(t, pos, vel, acc) {
+    const N = this.N, dt = this.dt;
+    const Kc = this.Kc, Kv = this.Kv, cR = this.cR, vR = this.vR;
+    const rho = this.rho, ch = this.ch, sh = this.sh, w = this.w;
+    for (let ax = 0; ax < 2; ax++) {
+      const a = this.axes[ax];
+      // warm start: shift the previous solution one step left (done FIRST
+      // so that after solve() returns, U[0]/traj all describe the solution
+      // just computed)
+      for (let k = 0; k < N - 1; k++) {
+        a.U[k] = a.U[k + 1]; a.z[k] = a.z[k + 1]; a.y[k] = a.y[k + 1];
+      }
+      const x0 = pos[ax], v0 = vel[ax];
+      for (let k = 0; k < N; k++) {
+        const bm = this.boundsAt(t + (k + 0.5) * dt);
+        a.lb[k] = bm[2 * ax]; a.ub[k] = bm[2 * ax + 1];
+        const tk = t + (k + 1) * dt;
+        a.ref[k] = this.plan.zmpRef(tk)[ax];
+        a.cref[k] = this.planAt(tk)[ax];
+        a.vref[k] = (this.planAt(tk + dt)[ax] - a.cref[k]) / dt;
+        a.cR0[k] = cR[2 * k] * x0 + cR[2 * k + 1] * v0;
+        a.vR0[k] = vR[2 * k] * x0 + vR[2 * k + 1] * v0;
+      }
+      // objective gradient at U = 0:
+      //   2qc·Kcᵀ(cR0 − cref) + 2qv·Kvᵀ(vR0 − vref) − 2q·zmpRef
+      for (let i = 0; i < N; i++) {
+        let sc = 0, sv = 0;
+        for (let j = i; j < N; j++) {
+          sc += Kc[j * N + i] * (a.cR0[j] - a.cref[j]);
+          sv += Kv[j * N + i] * (a.vR0[j] - a.vref[j]);
+        }
+        a.grad[i] = 2 * (this.qc * sc + this.qv * sv) - 2 * this.q * a.ref[i];
+      }
+      for (let it = 0; it < this.iters; it++) {
+        for (let i = 0; i < N; i++) a.rhs[i] = -a.grad[i] + rho * (a.z[i] - a.y[i]);
+        luSolve(this.Mlu, this.Mpiv, N, a.rhs, a.U);
+        for (let i = 0; i < N; i++) {
+          const zi = Math.min(a.ub[i], Math.max(a.lb[i], a.U[i] + a.y[i]));
+          a.y[i] += a.U[i] - zi;
+          a.z[i] = zi;
+        }
+      }
+      // roll the CoM trajectory under the optimal ZMP (exact LIPM ZOH)
+      let cx = x0, cv = v0;
+      a.traj[0] = cx;
+      a.trajV[0] = cv;
+      for (let k = 0; k < N; k++) {
+        const p = a.U[k];
+        const cn = ch * cx + (sh / w) * cv + (1 - ch) * p;
+        cv = w * sh * cx + ch * cv - w * sh * p;
+        cx = cn;
+        a.traj[k + 1] = cx;
+        a.trajV[k + 1] = cv;
+        a.zmp[k] = p;
+      }
+    }
+  }
+  // sample the last-solved optimized CoM trajectory tau seconds ahead of
+  // the solve origin → [x, y]
+  trajAt(tau) {
+    const k = Math.min(Math.max(tau / this.dt, 0), this.N);
+    const i = Math.floor(k), f = k - i;
+    const j = Math.min(i + 1, this.N);
+    return [this.axes[0].traj[i] + (this.axes[0].traj[j] - this.axes[0].traj[i]) * f,
+            this.axes[1].traj[i] + (this.axes[1].traj[j] - this.axes[1].traj[i]) * f];
+  }
+}
 // ---------------------------------------------------------------- WBC
 export class WalkingController {
   constructor(mujoco, model, data, gains, params) {
@@ -337,6 +608,7 @@ export class WalkingController {
     this.comCmd = [0, 0]; this.zmpMeas = [NaN, NaN];
     this.fell = false; this.done = false;
     this.status = 'init';
+    this.pushFy = 0; this.pushLeft = 0; this.captureUntil = -1;
   }
 
   com() { // measured whole-body CoM
@@ -380,7 +652,9 @@ export class WalkingController {
     this.balPos = [balX, balY];
     this.comTarget = [balX, balY, this.zc];
     this.plan = new GaitPlan(this.feet0, this.p);
-    this.preview = new OnlinePreview(this.gains, this.plan, this.plan.tEnd);
+    this.preview = this.p.controller === 'mpc'
+      ? new MpcPreview(this.gains, this.plan, this.plan.tEnd, this.zc, this.p)
+      : new OnlinePreview(this.gains, this.plan, this.plan.tEnd);
     this.prevPos = null;                 // first walk update initializes it
     this.comCmd = [balX, balY];
     this.walkWarmup = 0;
@@ -416,6 +690,30 @@ export class WalkingController {
       if (prev && prev.kind === 'ss') {
         const st = this.plan.steps.find((sp) => sp.tLift === prev.t0);
         this.hold[st.swing] = [st.xTo, this.plan.footY[st.swing], this.footZ];
+      }
+      // LATERAL CAPTURE, footstep re-placement (MPC mode): if the CoM
+      // enters the swing clearly displaced from the plan's lane, shift the
+      // swing foot's footfall toward it — the capture foot must be UNDER
+      // the falling CoM, not 4 cm off to the side. plan.footY is read live
+      // by zmpRef(), boundsAt() and the swing-goal code below, so the ZMP
+      // reference and the MPC support constraints follow the new landing
+      // automatically. Only the SWING foot's reference moves (the stance
+      // foot did not move); the other foot re-centers the lane at its own
+      // next swing. Timing alone (the clock pacing in updatePlanClock)
+      // cannot recover a push whose capture point lies outside the lane.
+      if (ph.kind === 'ss' && this.p.controller === 'mpc'
+          && this.t < this.captureUntil) {
+        const eLat = this.com()[1] - this.preview.planAt(t)[1];
+        if (Math.abs(eLat) > 0.04) {
+          const shift =
+            Math.max(-0.05, Math.min(0.05, 0.7 * (eLat - Math.sign(eLat) * 0.04)));
+          this.plan.footY[ph.swing] += shift;
+          // NOTE: the frozen nominal CoM plan deliberately stays on the old
+          // lane — the command law's beta·(plan − mpcTraj) term NEEDS the
+          // uncompromised plan as its reference; re-rolling the plan toward
+          // the robot would cancel the very correction that performs the
+          // recovery.
+        }
       }
     }
     if (ph.kind === 'ss') {
@@ -495,6 +793,37 @@ export class WalkingController {
     this.prevVel = this.estVel.slice();
     this.estAcc = [sym(0.3 * this.estAcc[0] + 0.7 * accRaw[0], 8),
                    sym(0.3 * this.estAcc[1] + 0.7 * accRaw[1], 8)];
+
+    if (this.p.controller === 'mpc') {
+      // LIPM-ZMP linear MPC: re-solve the support-polygon-constrained
+      // receding-horizon QP from the measured state — see MpcPreview. The
+      // command law mirrors the proven preview controller exactly, with
+      // the MPC's constraint-aware trajectory substituted for the LQR
+      // re-simulation:
+      //   cmd = plan(t+lead) + beta·(plan(t+lead) − mpcTraj(t+lead))
+      // The plan carries the deep countdown (the QP re-solved from rest is
+      // always lazier than the plan); the MPC trajectory starts at the
+      // measured state and respects the upcoming support polygons, so the
+      // correction bends the command back onto a feasible path. Tube-
+      // clamped around the plan like comTube in the preview mode.
+      const mpc = this.preview;
+      mpc.solve(t, pos, this.estVel, this.estAcc);
+      const leadX = this.p.mpcLeadX ?? 0.04, leadY = this.p.mpcLeadY ?? 0.12;
+      const beta = this.p.mpcFeedback ?? 1.2;
+      const plX = mpc.planAt(t + leadX), plY = mpc.planAt(t + leadY);
+      const trX = mpc.trajAt(leadX)[0], trY = mpc.trajAt(leadY)[1];
+      const tx = plX[0] + beta * (plX[0] - trX);
+      const ty = plY[1] + beta * (plY[1] - trY);
+      const pl = mpc.planAt(t);
+      const tube = this.p.mpcTube ?? 0.05;
+      const cl = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+      const cx = cl(tx, pl[0] - tube, pl[0] + tube);
+      const cy = cl(ty, pl[1] - tube, pl[1] + tube);
+      this.rawCmd = [tx, ty];
+      this.comCmd = [cx, cy];
+      this.comTarget = [cx, cy, this.zc];
+      return this.comTarget;
+    }
 
     const pc = this.preview;
     pc.resim(t, pos, this.estVel, this.estAcc);
@@ -765,16 +1094,60 @@ export class WalkingController {
     // the clock by BOTH the sagittal position error and the velocity
     // mismatch: a trailing or slow robot slows the whole gait down until it
     // catches up, so long walks keep plan and robot consistent.
+    //
+    // MPC mode adds CAPTURE-STEP PACING: a lateral CoM deviation from the
+    // plan means the fixed footstep timing is wrong for the disturbance —
+    // falling toward the SWING side needs the swing foot down NOW (end the
+    // single support early), falling toward the STANCE side needs the
+    // stance foot to keep decelerating (stretch it). The effect of the
+    // lateral error on the clock therefore flips with the swing side.
+    // Without this the QP can only watch its own predicted fall: the
+    // support-polygon constraints come from the planned timeline, and the
+    // one transition that could save the robot arrives too late.
     const pc = this.preview;
     const pl = pc.planAt(this.tPlan);
     const pl2 = pc.planAt(this.tPlan + 0.1);
     const vPlan = (pl2[0] - pl[0]) / 0.1;
-    const e = this.com()[0] - pl[0];
+    const c = this.com();
+    const e = c[0] - pl[0];
     const vErr = (this.estVel ? this.estVel[0] : 0) - vPlan;
     const k = this.p.clockGain ?? 0;
     const kv = this.p.clockVelGain ?? 0;
-    this.clockRate = Math.max(0.6, Math.min(1.3, 1 + k * e + kv * vErr));
+    let rate = 1 + k * e + kv * vErr;
+    let clampHi = 1.3, clampLo = 0.6;
+    // CAPTURE-STEP PACING (MPC, always on): falling toward the swing side
+    // compresses the swing (land early — its ZMP authority is needed now);
+    // velocity (not position) error — after a capture the plan's sway
+    // phase stays offset from the robot, and a position term would stay
+    // biased. Nominal gait tolerates this: verified PASS with unchanged
+    // nominal tracking. A lateral recovery also steals forward momentum,
+    // so the sagittal pacing gets extra room to wait (clampLo 0.5).
+    if (this.p.controller === 'mpc') {
+      clampHi = 1.5;
+      const ph = this.plan.phaseAt(this.tPlan);
+      if (ph.kind === 'ss') {
+        const vPlanY = (pc.planAt(this.tPlan + 0.1)[1] - pl[1]) / 0.1;
+        const vLatErr = (this.estVel ? this.estVel[1] : 0) - vPlanY;
+        const dir = ph.swing === 'left' ? 1 : -1;   // +vy = toward left foot
+        const dead = Math.sign(vLatErr) *
+          Math.max(0, Math.abs(vLatErr * dir) - 0.12);
+        rate += (this.p.clockLatGain ?? 1.5) * dead;
+      }
+    }
+    this.clockRate = Math.max(clampLo, Math.min(clampHi, rate));
     this.tPlan += dti * this.clockRate;
+  }
+
+  // horizontal push disturbance: apply force fy (N, world y) to the pelvis
+  // for dur seconds — the standard way to probe walking robustness (the
+  // MPC's support-polygon constraints exist exactly for this). Also ARMS
+  // the capture machinery (footstep re-placement) for a window: nominal
+  // sway reaches the same CoM deviations a real push leaves behind, so the
+  // capture must never trigger on undisturbed walking.
+  applyPush(fy, dur = 0.15) {
+    this.pushFy = fy;
+    this.pushLeft = dur;
+    this.captureUntil = (this.t ?? 0) + 2.5;
   }
 
   stepPhysics() { // one mujoco step (dt=0.002)
@@ -787,6 +1160,13 @@ export class WalkingController {
       this.footTargetsUpdate(this.tPlan);
       this.comTargetUpdate(this.tPlan, dti);
       this.updateIK(dti);
+    }
+    if (this.pushLeft > 0) {
+      this.data.xfrc_applied[this.pelvisId * 6 + 1] = this.pushFy;
+      this.pushLeft -= dt;
+    } else if (this.pushFy) {
+      this.data.xfrc_applied[this.pelvisId * 6 + 1] = 0;
+      this.pushFy = 0;
     }
     this.data.ctrl.set(this.ctrl);
     this.mj.mj_step(this.model, this.data);
